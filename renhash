@@ -9,10 +9,10 @@ set -Eeuo pipefail
 VERSION="1.5"
 SCRIPT_NAME="renhash"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
-remote_url="https://raw.githubusercontent.com/USERNAME/renhash/main/renhash"  # <-- set to your repo raw URL for --update
+remote_url="https://raw.githubusercontent.com/USERNAME/renhash/main/renhash" # <-- set to your repo raw URL for --update
 
 # ---------- Defaults ----------
-prefix="flower"
+prefix="default"
 start=1
 digits=3
 pattern="*.png"
@@ -21,34 +21,75 @@ dry_run=0
 use_color=1
 limit_print=0
 plan_file=""
-sort_key="old"   # old|new
+sort_key="old" # old|new
 undo_file=""
 
 # ---------- Arg parse ----------
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --prefix) prefix="${2:?}"; shift 2;;
-    --start)  start="${2:?}"; shift 2;;
-    --digits) digits="${2:?}"; shift 2;;
-    --pattern) pattern="${2:?}"; shift 2;;
-    --jobs)   jobs="${2:?}"; shift 2;;
-    --dry-run) dry_run=1; shift;;
-    --limit)  limit_print="${2:?}"; shift 2;;
-    --plan)   plan_file="${2:?}"; shift 2;;
-    --sort)   sort_key="${2:?}"; shift 2;;
-    --undo)   undo_file="${2:?}"; shift 2;;
-    --no-color) use_color=0; shift;;
-    --version|-v) echo "$SCRIPT_NAME v$VERSION"; exit 0;;
-    --update)
-      if [[ -z "$remote_url" || "$remote_url" == *"USERNAME/renhash"* ]]; then
-        echo "No valid update URL configured. Edit \$remote_url in the script." >&2; exit 1
-      fi
-      command -v curl >/dev/null 2>&1 || { echo "curl required for --update" >&2; exit 1; }
-      curl -fsSL "$remote_url" -o "$SCRIPT_PATH" && chmod +x "$SCRIPT_PATH"
-      echo "Updated $SCRIPT_NAME from $remote_url" >&2
-      exit 0;;
-    -h|--help)
-cat <<'HELP'
+  --prefix)
+    prefix="${2:?}"
+    shift 2
+    ;;
+  --start)
+    start="${2:?}"
+    shift 2
+    ;;
+  --digits)
+    digits="${2:?}"
+    shift 2
+    ;;
+  --pattern)
+    pattern="${2:?}"
+    shift 2
+    ;;
+  --jobs)
+    jobs="${2:?}"
+    shift 2
+    ;;
+  --dry-run)
+    dry_run=1
+    shift
+    ;;
+  --limit)
+    limit_print="${2:?}"
+    shift 2
+    ;;
+  --plan)
+    plan_file="${2:?}"
+    shift 2
+    ;;
+  --sort)
+    sort_key="${2:?}"
+    shift 2
+    ;;
+  --undo)
+    undo_file="${2:?}"
+    shift 2
+    ;;
+  --no-color)
+    use_color=0
+    shift
+    ;;
+  --version | -v)
+    echo "$SCRIPT_NAME v$VERSION"
+    exit 0
+    ;;
+  --update)
+    if [[ -z "$remote_url" || "$remote_url" == *"USERNAME/renhash"* ]]; then
+      echo "No valid update URL configured. Edit \$remote_url in the script." >&2
+      exit 1
+    fi
+    command -v curl >/dev/null 2>&1 || {
+      echo "curl required for --update" >&2
+      exit 1
+    }
+    curl -fsSL "$remote_url" -o "$SCRIPT_PATH" && chmod +x "$SCRIPT_PATH"
+    echo "Updated $SCRIPT_NAME from $remote_url" >&2
+    exit 0
+    ;;
+  -h | --help)
+    cat <<'HELP'
 renhash — fast parallel renamer to <prefix>_<index>_<RANDOM6>.<ext>, with undo.
 
 Usage:
@@ -77,8 +118,12 @@ Notes:
   * Indexing is deterministic by sorted filename; avoids overwrites.
   * GNU parallel (if installed) accelerates hashing/renaming and shows bars.
 HELP
-      exit 0;;
-    *) echo "Unknown option: $1" >&2; exit 1;;
+    exit 0
+    ;;
+  *)
+    echo "Unknown option: $1" >&2
+    exit 1
+    ;;
   esac
 done
 
@@ -87,62 +132,84 @@ done
 if [[ ! -t 1 ]]; then use_color=0; fi
 if [[ $use_color -eq 1 ]]; then
   C0="$(printf '\033[0m')"
-  CG="$(printf '\033[38;5;112m')"  # green
-  CY="$(printf '\033[38;5;214m')"  # yellow
-  CR="$(printf '\033[38;5;203m')"  # red
-  CB="$(printf '\033[38;5;81m')"   # cyan (banners)
-  CS="$(printf '\033[38;5;39m')"   # blue (SOURCE)
-  CD="$(printf '\033[38;5;199m')"  # magenta (DEST)
-  OK="✓"; WARN="⚠"; ERR="✗"
+  CG="$(printf '\033[38;5;112m')" # green
+  CY="$(printf '\033[38;5;214m')" # yellow
+  CR="$(printf '\033[38;5;203m')" # red
+  CB="$(printf '\033[38;5;81m')"  # cyan (banners)
+  CS="$(printf '\033[38;5;39m')"  # blue (SOURCE)
+  CD="$(printf '\033[38;5;199m')" # magenta (DEST)
+  OK="✓"
+  WARN="⚠"
+  ERR="✗"
 else
-  C0=""; CG=""; CY=""; CR=""; CB=""; CS=""; CD=""
-  OK="[OK]"; WARN="[!]"; ERR="[X]"
+  C0=""
+  CG=""
+  CY=""
+  CR=""
+  CB=""
+  CS=""
+  CD=""
+  OK="[OK]"
+  WARN="[!]"
+  ERR="[X]"
 fi
 # All logs go to STDERR so they never corrupt TSV streams
-banner(){ printf "%b==> %s%b\n" "$CB" "$1" "$C0" >&2; }
-ok()    { printf "%b%s%b %s\n" "$CG" "$OK" "$C0" "$*" >&2; }
-warn()  { printf "%b%s%b %s\n" "$CY" "$WARN" "$C0" "$*" >&2; }
-err()   { printf "%b%s%b %s\n" "$CR" "$ERR" "$C0" "$*" >&2; }
-die()   { err "$*"; exit 1; }
+banner() { printf "%b==> %s%b\n" "$CB" "$1" "$C0" >&2; }
+ok() { printf "%b%s%b %s\n" "$CG" "$OK" "$C0" "$*" >&2; }
+warn() { printf "%b%s%b %s\n" "$CY" "$WARN" "$C0" "$*" >&2; }
+err() { printf "%b%s%b %s\n" "$CR" "$ERR" "$C0" "$*" >&2; }
+die() {
+  err "$*"
+  exit 1
+}
 
 # ---------- Undo mode (dst -> src) ----------
 if [[ -n "$undo_file" ]]; then
   [[ -f "$undo_file" ]] || die "Undo file not found: $undo_file"
   banner "UNDO from TSV: $undo_file"
   if [[ "$dry_run" -eq 1 ]]; then
-    awk -F'\t' -v S="$CS" -v D="$CD" -v R="$C0" '{printf "%s\"%s\"%s -> %s\"%s\"%s\n", D,$2,R,S,$1,R}' "$undo_file" \
-      | { if [[ "$limit_print" -gt 0 ]]; then head -n "$limit_print"; else cat; fi; }
+    awk -F'\t' -v S="$CS" -v D="$CD" -v R="$C0" '{printf "%s\"%s\"%s -> %s\"%s\"%s\n", D,$2,R,S,$1,R}' "$undo_file" |
+      { if [[ "$limit_print" -gt 0 ]]; then head -n "$limit_print"; else cat; fi; }
     ok "Undo dry run complete. No files were changed."
     exit 0
   fi
   do_undo() {
-    local src="$1" dst="$2"   # src=original, dst=current
+    local src="$1" dst="$2" # src=original, dst=current
     if [[ ! -e "$dst" ]]; then
-      warn "Skip (missing): $dst"; return 0
+      warn "Skip (missing): $dst"
+      return 0
     fi
     if [[ -e "$src" && "$(readlink -f -- "$src")" != "$(readlink -f -- "$dst")" ]]; then
-      warn "Skip (would overwrite): $src"; return 0
+      warn "Skip (would overwrite): $src"
+      return 0
     fi
-    if mv -- "$dst" "$src"; then ok "Reverted: $dst → $src"; else err "Failed: $dst → $src"; return 1; fi
+    if mv -- "$dst" "$src"; then ok "Reverted: $dst → $src"; else
+      err "Failed: $dst → $src"
+      return 1
+    fi
   }
   export -f do_undo ok warn err
   if command -v parallel >/dev/null 2>&1; then
     awk -F'\t' '{printf "do_undo \"%s\" \"%s\"\n", $1, $2}' "$undo_file" | parallel --no-notice --linebuffer
   else
-    while IFS=$'\t' read -r src dst; do do_undo "$src" "$dst"; done < "$undo_file"
+    while IFS=$'\t' read -r src dst; do do_undo "$src" "$dst"; done <"$undo_file"
   fi
   ok "Undo complete."
   exit 0
 fi
 
 # ---------- Regular rename mode ----------
-has_parallel=0; command -v parallel >/dev/null 2>&1 && has_parallel=1
+has_parallel=0
+command -v parallel >/dev/null 2>&1 && has_parallel=1
 
 # Collect files
 shopt -s nullglob
 mapfile -d '' files < <(bash -lc 'shopt -s nullglob; for f in '"$pattern"'; do printf "%s\0" "$f"; done' | LC_ALL=C sort -z)
 total=${#files[@]}
-(( total == 0 )) && { warn "No files match pattern: $pattern"; exit 0; }
+((total == 0)) && {
+  warn "No files match pattern: $pattern"
+  exit 0
+}
 
 banner "Found $total file(s). Prefix='${prefix}', start=${start}, digits=${digits}, jobs=${jobs}${dry_run:+, DRY-RUN}"
 
@@ -158,41 +225,47 @@ rand6() {
     od -An -N3 -tx1 /dev/urandom | tr -d ' \n' | tr '[:lower:]' '[:upper:]'
   fi
 }
-gen_hash_line(){ local file="$1" h; h="$(rand6)"; printf "%s\t%s\n" "$file" "$h"; }
+gen_hash_line() {
+  local file="$1" h
+  h="$(rand6)"
+  printf "%s\t%s\n" "$file" "$h"
+}
 export -f gen_hash_line rand6
 
 # Pass 1: generate random hashes
 banner "Pass 1/3: generating random hashes"
 if [[ $has_parallel -eq 1 ]]; then
   if [[ $dry_run -eq 1 ]]; then
-    printf "%s\0" "${files[@]}" \
-      | parallel -0 -n1 -j "$jobs" --no-notice --linebuffer gen_hash_line {} \
-      | LC_ALL=C sort -t $'\t' -k1,1 > "$hashes_tsv"
+    printf "%s\0" "${files[@]}" |
+      parallel -0 -n1 -j "$jobs" --no-notice --linebuffer gen_hash_line {} |
+      LC_ALL=C sort -t $'\t' -k1,1 >"$hashes_tsv"
   else
-    printf "%s\0" "${files[@]}" \
-      | parallel -0 -n1 -j "$jobs" --no-notice --bar --linebuffer gen_hash_line {} \
-      | LC_ALL=C sort -t $'\t' -k1,1 > "$hashes_tsv"
+    printf "%s\0" "${files[@]}" |
+      parallel -0 -n1 -j "$jobs" --no-notice --bar --linebuffer gen_hash_line {} |
+      LC_ALL=C sort -t $'\t' -k1,1 >"$hashes_tsv"
   fi
 else
-  : > "$hashes_tsv"; for f in "${files[@]}"; do gen_hash_line "$f" >> "$hashes_tsv"; done
+  : >"$hashes_tsv"
+  for f in "${files[@]}"; do gen_hash_line "$f" >>"$hashes_tsv"; done
 fi
 ok "Hashes prepared"
 
 # Compute padding width BEFORE mapping; warn to STDERR only
-max_index=$(( start + total - 1 ))
+max_index=$((start + total - 1))
 required_digits=${#max_index}
-if (( digits < required_digits )); then
+if ((digits < required_digits)); then
   digits=$required_digits
   warn "Padding expanded to ${digits} digits to accommodate index ${max_index}"
 fi
 
 # Pass 2: assign indices, emit ONLY TSV lines to stdout (captured into mapping_tsv)
 banner "Pass 2/3: assigning indices"
-pad(){ printf "%0*d" "$digits" "$1"; }
+pad() { printf "%0*d" "$digits" "$1"; }
 declare -A used_targets=()
 i="$start"
 while IFS=$'\t' read -r file h; do
-  ext="${file##*.}"; [[ "$ext" == "$file" ]] && ext="png"
+  ext="${file##*.}"
+  [[ "$ext" == "$file" ]] && ext="png"
   while :; do
     idx="$(pad "$i")"
     new="${prefix}_${idx}_${h}.${ext}"
@@ -202,11 +275,14 @@ while IFS=$'\t' read -r file h; do
   used_targets["$new"]=1
   printf "%s\t%s\n" "$file" "$new"
   ((i++))
-done < "$hashes_tsv" > "$mapping_tsv"
+done <"$hashes_tsv" >"$mapping_tsv"
 ok "Index mapping created"
 
 # Optionally save plan
-[[ -n "$plan_file" ]] && { cp "$mapping_tsv" "$plan_file"; ok "Wrote plan TSV → $plan_file"; }
+[[ -n "$plan_file" ]] && {
+  cp "$mapping_tsv" "$plan_file"
+  ok "Wrote plan TSV → $plan_file"
+}
 
 # Dry-run: show colored plan (to STDOUT), nothing else
 if [[ "$dry_run" -eq 1 ]]; then
@@ -217,24 +293,28 @@ if [[ "$dry_run" -eq 1 ]]; then
     sortfeed() { cat "$mapping_tsv"; }
   fi
   sortfeed | awk -F'\t' -v S="$CS" -v D="$CD" -v R="$C0" \
-                   '{printf "%s\"%s\"%s -> %s\"%s\"%s\n", S,$1,R,D,$2,R}' \
-         | { if [[ "$limit_print" -gt 0 ]]; then head -n "$limit_print"; else cat; fi; }
+    '{printf "%s\"%s\"%s -> %s\"%s\"%s\n", S,$1,R,D,$2,R}' |
+    { if [[ "$limit_print" -gt 0 ]]; then head -n "$limit_print"; else cat; fi; }
   ok "Dry run complete. No files were renamed."
-  rm -rf "$tmpdir"; exit 0
+  rm -rf "$tmpdir"
+  exit 0
 fi
 
 # Pass 3: perform renames
 banner "Pass 3/3: renaming files"
-do_move(){
+do_move() {
   local src="$1" dst="$2"
-  if mv -- "$src" "$dst"; then ok "Renamed: $src → $dst"; else err "Failed: $src → $dst"; return 1; fi
+  if mv -- "$src" "$dst"; then ok "Renamed: $src → $dst"; else
+    err "Failed: $src → $dst"
+    return 1
+  fi
 }
 export -f do_move ok err
 if [[ $has_parallel -eq 1 ]]; then
-  awk -F'\t' '{printf "do_move \"%s\" \"%s\"\n", $1, $2}' "$mapping_tsv" \
-    | parallel -j "$jobs" --no-notice --bar --linebuffer
+  awk -F'\t' '{printf "do_move \"%s\" \"%s\"\n", $1, $2}' "$mapping_tsv" |
+    parallel -j "$jobs" --no-notice --bar --linebuffer
 else
-  while IFS=$'\t' read -r src dst; do do_move "$src" "$dst"; done < "$mapping_tsv"
+  while IFS=$'\t' read -r src dst; do do_move "$src" "$dst"; done <"$mapping_tsv"
 fi
 
 ok "All done."
