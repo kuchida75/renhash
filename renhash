@@ -1,0 +1,358 @@
+#!/usr/bin/env bash
+# renhash v1.4
+# Rename to: <prefix>_<index>_<RANDOM6>.<ext>  (and undo with --undo plan.tsv)
+# v1.4: dynamic digit expansion (padding grows automatically as index increases)
+
+set -Eeuo pipefail
+
+VERSION="1.4"
+SCRIPT_NAME="renhash"
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+remote_url="https://raw.githubusercontent.com/kuchida75/renhash/main/renhash"
+
+
+# ---------- Defaults ----------
+prefix="default"
+start=1
+digits=3 # initial minimum width; expands automatically as needed
+pattern="*.png"
+jobs="$(nproc || echo 4)"
+dry_run=0
+use_color=1
+limit_print=0
+plan_file=""
+sort_key="old" # old|new
+undo_file=""
+resume=0
+
+# ---------- Args ----------
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+  --prefix)
+    prefix="${2:?}"
+    shift 2
+    ;;
+  --start)
+    start="${2:?}"
+    shift 2
+    ;;
+  --digits)
+    digits="${2:?}"
+    shift 2
+    ;;
+  --pattern)
+    pattern="${2:?}"
+    shift 2
+    ;;
+  --jobs)
+    jobs="${2:?}"
+    shift 2
+    ;;
+  --dry-run)
+    dry_run=1
+    shift
+    ;;
+  --limit)
+    limit_print="${2:?}"
+    shift 2
+    ;;
+  --plan)
+    plan_file="${2:?}"
+    shift 2
+    ;;
+  --sort)
+    sort_key="${2:?}"
+    shift 2
+    ;;
+  --undo)
+    undo_file="${2:?}"
+    shift 2
+    ;;
+  --resume)
+    resume=1
+    shift
+    ;;
+  --no-color)
+    use_color=0
+    shift
+    ;;
+  --version | -v)
+    echo "$SCRIPT_NAME v$VERSION"
+    exit 0
+    ;;
+  --update)
+    if [[ -z "$remote_url" || "$remote_url" == https://example.com/renhash ]]; then
+      echo "No update URL configured. Edit \$remote_url in the script." >&2
+      exit 1
+    fi
+    command -v curl >/dev/null 2>&1 || {
+      echo "curl required for --update" >&2
+      exit 1
+    }
+    curl -fsSL "$remote_url" -o "$SCRIPT_PATH" && chmod +x "$SCRIPT_PATH"
+    echo "Updated $SCRIPT_NAME from $remote_url"
+    exit 0
+    ;;
+  -h | --help)
+    cat <<'HELP'
+renhash — rename images to <prefix>_<index>_<RANDOM6>.<ext>, and undo later.
+
+Usage:
+  renhash [options]
+
+General:
+  --prefix NAME        Prefix for new files (default: flower)
+  --start N            Starting index (default: 1)
+  --digits N           Zero padding minimum width (default: 3; auto-expands)
+  --pattern GLOB       File pattern (default: *.png)
+  --jobs N             Parallel workers (default: nproc)
+
+Modes:
+  --dry-run            Preview only; print PLAN (no changes)
+  --limit N            In dry-run, show only first N lines
+  --plan FILE          Save full TSV mapping to FILE (src<TAB>dst)
+  --sort old|new       Sort PLAN by old or new name (default: old)
+  --undo FILE          Revert using a TSV plan (moves dst -> src); honors --dry-run
+  --resume             Start at (max existing index + 1) for the chosen prefix
+  --no-color           Disable colored output and icons
+  --version, -v        Show version
+  --update             Self-update from remote URL
+  -h, --help           Show this help
+
+Notes:
+  * Dynamic width: padding grows automatically as index increases (e.g., ...0999 → 1000).
+  * Each file gets a fresh random 6-char uppercase hex hash (e.g., A3F9BC).
+  * Indexing is deterministic by sorted filename; avoids overwrites.
+  * Progress bars shown in real runs if GNU parallel is installed.
+HELP
+    exit 0
+    ;;
+  *)
+    echo "Unknown option: $1" >&2
+    exit 1
+    ;;
+  esac
+done
+
+# ---------- Colors & Icons ----------
+if [[ ! -t 1 ]]; then use_color=0; fi
+if [[ $use_color -eq 1 ]]; then
+  C0="$(printf '\033[0m')"
+  CG="$(printf '\033[38;5;112m')" # green
+  CY="$(printf '\033[38;5;214m')" # yellow
+  CR="$(printf '\033[38;5;203m')" # red
+  CB="$(printf '\033[38;5;81m')"  # cyan (banners)
+  CS="$(printf '\033[38;5;39m')"  # blue for SOURCE
+  CD="$(printf '\033[38;5;199m')" # magenta for DEST
+  OK="✓"
+  WARN="⚠"
+  ERR="✗"
+else
+  C0=""
+  CG=""
+  CY=""
+  CR=""
+  CB=""
+  CS=""
+  CD=""
+  OK="[OK]"
+  WARN="[!]"
+  ERR="[X]"
+fi
+banner() { printf "%b==> %s%b\n" "$CB" "$1" "$C0"; }
+ok() { printf "%b%s%b %s\n" "$CG" "$OK" "$C0" "$*"; }
+warn() { printf "%b%s%b %s\n" "$CY" "$WARN" "$C0" "$*"; }
+err() { printf "%b%s%b %s\n" "$CR" "$ERR" "$C0" "$*" >&2; }
+die() {
+  err "$*"
+  exit 1
+}
+
+# ---------- Undo mode ----------
+if [[ -n "$undo_file" ]]; then
+  [[ -f "$undo_file" ]] || die "Undo file not found: $undo_file"
+  banner "UNDO from TSV: $undo_file"
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    awk -F'\t' -v S="$CS" -v D="$CD" -v R="$C0" '{printf "%s\"%s\"%s -> %s\"%s\"%s\n", S,$2,R,D,$1,R}' "$undo_file" |
+      { if [[ "$limit_print" -gt 0 ]]; then head -n "$limit_print"; else cat; fi; }
+    ok "Undo dry run complete. No files were changed."
+    exit 0
+  fi
+
+  do_undo() {
+    local src="$1" dst="$2"
+    if [[ ! -e "$dst" ]]; then
+      warn "Skip (missing): $dst"
+      return 0
+    fi
+    if [[ -e "$src" && "$(readlink -f -- "$src")" != "$(readlink -f -- "$dst")" ]]; then
+      warn "Skip (would overwrite): $src"
+      return 0
+    fi
+    if mv -- "$dst" "$src"; then ok "Reverted: $dst → $src"; else
+      err "Failed: $dst → $src"
+      return 1
+    fi
+  }
+  export -f do_undo ok warn err
+
+  if command -v parallel >/dev/null 2>&1; then
+    awk -F'\t' '{printf "do_undo \"%s\" \"%s\"\n", $1, $2}' "$undo_file" | parallel --no-notice --linebuffer
+  else
+    while IFS=$'\t' read -r src dst; do do_undo "$src" "$dst"; done <"$undo_file"
+  fi
+  ok "Undo complete."
+  exit 0
+fi
+
+# ---------- Regular rename mode ----------
+has_parallel=0
+command -v parallel >/dev/null 2>&1 && has_parallel=1
+
+# Gather files
+shopt -s nullglob
+mapfile -d '' files < <(bash -lc 'shopt -s nullglob; for f in '"$pattern"'; do printf "%s\0" "$f"; done' | LC_ALL=C sort -z)
+total=${#files[@]}
+((total == 0)) && {
+  warn "No files match pattern: $pattern"
+  exit 0
+}
+
+banner "Found $total file(s). Prefix='${prefix}', start=${start}, digits=${digits}, jobs=${jobs}${dry_run:+, DRY-RUN}"
+
+# --resume: compute next index from existing files
+compute_resume_start() {
+  local max
+  max="$(find . -maxdepth 1 -type f -printf '%f\n' |
+    awk -v p="$prefix" '
+        index($0,p"_")==1 {
+          rest = substr($0, length(p)+2)
+          if (match(rest, /^[0-9]+_/)) {
+            n = substr(rest, 1, RLENGTH-1)
+            if (n+0 > max) max = n+0
+          }
+        }
+        END { if (max>0) print max; }
+      ')"
+  if [[ -n "$max" ]]; then
+    start=$((max + 1))
+    banner "Resume: detected max index ${max}; starting at ${start}"
+    # ensure initial width is at least the digits of max (for consistency)
+    if ((${#max} > digits)); then digits=${#max}; fi
+  else
+    banner "Resume: no existing indices for prefix '${prefix}'; starting at ${start}"
+  fi
+}
+if [[ $resume -eq 1 ]]; then compute_resume_start; fi
+
+tmpdir="$(mktemp -d)"
+hashes_tsv="$tmpdir/hashes.tsv"
+mapping_tsv="$tmpdir/mapping.tsv"
+
+# Random 6-char (uppercase HEX)
+rand6() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 3 | tr '[:lower:]' '[:upper:]'
+  else
+    od -An -N3 -tx1 /dev/urandom | tr -d ' \n' | tr '[:lower:]' '[:upper:]'
+  fi
+}
+gen_hash_line() {
+  local file="$1" h
+  h="$(rand6)"
+  printf "%s\t%s\n" "$file" "$h"
+}
+export -f gen_hash_line rand6
+
+banner "Pass 1/3: generating random hashes"
+if command -v parallel >/dev/null 2>&1; then
+  if [[ $dry_run -eq 1 ]]; then
+    printf "%s\0" "${files[@]}" | parallel -0 -n1 -j "$jobs" --no-notice --linebuffer gen_hash_line {} |
+      LC_ALL=C sort -t $'\t' -k1,1 >"$hashes_tsv"
+  else
+    printf "%s\0" "${files[@]}" | parallel -0 -n1 -j "$jobs" --no-notice --bar --linebuffer gen_hash_line {} |
+      LC_ALL=C sort -t $'\t' -k1,1 >"$hashes_tsv"
+  fi
+else
+  : >"$hashes_tsv"
+  for f in "${files[@]}"; do gen_hash_line "$f" >>"$hashes_tsv"; done
+fi
+ok "Hashes prepared"
+
+# Dynamic padding state: current minimum width; expands as needed
+current_width="$digits"
+pad() {
+  local n="$1"
+  local len=${#n}
+  if ((len > current_width)); then
+    current_width=$len
+    # Optional: announce width expansion (only in real run to avoid noisy dry-run)
+    if [[ $dry_run -eq 0 ]]; then
+      banner "Padding expanded to ${current_width} digits"
+    fi
+  fi
+  printf "%0*d" "$current_width" "$n"
+}
+
+banner "Pass 2/3: assigning indices (min width ${digits}, auto-expand on demand)"
+declare -A used_targets=()
+i="$start"
+while IFS=$'\t' read -r file h; do
+  ext="${file##*.}"
+  [[ "$ext" == "$file" ]] && ext="png"
+  # find the next free index; padding will grow automatically if i exceeds current width
+  while :; do
+    idx="$(pad "$i")"
+    new="${prefix}_${idx}_${h}.${ext}"
+    if [[ ! -e "$new" && -z "${used_targets[$new]+x}" ]]; then break; fi
+    ((i++))
+  done
+  used_targets["$new"]=1
+  printf "%s\t%s\n" "$file" "$new"
+  ((i++))
+done <"$hashes_tsv" >"$mapping_tsv"
+ok "Index mapping created (starting at $start; final width ${current_width})"
+
+[[ -n "$plan_file" ]] && {
+  cp "$mapping_tsv" "$plan_file"
+  ok "Wrote plan TSV → $plan_file"
+}
+
+# Dry run: colorized source/dest
+if [[ "$dry_run" -eq 1 ]]; then
+  banner "PLAN"
+  if [[ "$sort_key" == "new" ]]; then
+    sortfeed() { awk -F'\t' '{print $2"\t"$1}' "$mapping_tsv" | LC_ALL=C sort | awk -F'\t' '{print $2"\t"$1}'; }
+  else
+    sortfeed() { cat "$mapping_tsv"; }
+  fi
+  sortfeed | awk -F'\t' -v S="$CS" -v D="$CD" -v R="$C0" \
+    '{printf "%s\"%s\"%s -> %s\"%s\"%s\n", S,$1,R,D,$2,R}' |
+    { if [[ "$limit_print" -gt 0 ]]; then head -n "$limit_print"; else cat; fi; }
+  ok "Dry run complete. No files were renamed."
+  rm -rf "$tmpdir"
+  exit 0
+fi
+
+banner "Pass 3/3: renaming files"
+do_move() {
+  local src="$1" dst="$2"
+  if mv -- "$src" "$dst"; then
+    ok "Renamed: $src → $dst"
+  else
+    err "Failed:   $src → $dst"
+    return 1
+  fi
+}
+export -f do_move ok err
+
+if command -v parallel >/dev/null 2>&1; then
+  awk -F'\t' '{printf "do_move \"%s\" \"%s\"\n", $1, $2}' "$mapping_tsv" |
+    parallel -j "$jobs" --no-notice --bar --linebuffer
+else
+  while IFS=$'\t' read -r src dst; do do_move "$src" "$dst"; done <"$mapping_tsv"
+fi
+
+ok "All done."
+rm -rf "$tmpdir"
