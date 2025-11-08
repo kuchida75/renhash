@@ -37,3 +37,42 @@ renhash --dry-run --pad 4 --prefix IMG_ .
 
 # Execute renaming for real
 renhash --pad 4 --prefix IMG_ .
+
+renhash [OPTIONS] [PATH]
+
+Core:
+  --dry-run                 Show planned renames only
+  --copy                    Copy files instead of moving
+  --overwrite               Allow overwriting if the target exists
+
+Indexing:
+  --start N                 First index (default: 1)
+  --resume                  Continue from highest existing index
+  --resume-from N           Continue from specific index N
+  --pad N                   Zero-pad width (e.g., 4 → 0001)
+  --step N                  Increment step (default: 1)
+
+Naming:
+  --prefix STR              Add prefix before number
+  --suffix STR              Add suffix before extension
+  --lower | --upper         Force case
+
+Ordering:
+  --sort name|mtime|hash    Sort input (default: name)
+  --reverse                 Reverse sort order
+
+Scope:
+  --ext "jpg,png,mp4"       Only these extensions
+  --exclude "tmp,txt"       Exclude these extensions
+  --depth N                 Max directory depth
+  --hidden                  Include dotfiles
+
+Layout:
+  --dir DIR                 Output directory (default: in-place)
+  --pattern "{n}.{ext}"     Custom pattern; tokens: {n},{name},{base},{ext}
+
+Utilities:
+  --undo-file FILE          Use file of “old → new” pairs to undo
+  --log FILE                Write operations to FILE
+  -h, --help                Show help
+  -V, --version             Show version
