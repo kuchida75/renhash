@@ -76,3 +76,6 @@ Utilities:
   --log FILE                Write operations to FILE
   -h, --help                Show help
   -V, --version             Show version
+
+## 🧾 Releases
+See [Releases](../../releases) for changelog and downloadable versions.
