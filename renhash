@@ -1,243 +1,443 @@
 #!/usr/bin/env bash
-# renhash v1.7.1
-# Rename: <prefix>_<index>_<RANDOM6>.<ext>
-# RANDOM6 = fresh uppercase hex (e.g., 1F9AB2)
-# Deterministic indexing (sorted), collision-safe. Supports --resume/--resume-from & undo.
-
+# renhash v1.8.0 — current-directory renaming, chronological numbering and safe undo.
 set -Eeuo pipefail
+export LC_ALL=C
 
-VERSION="1.7.1"
+VERSION="1.8.0"
 SCRIPT_NAME="renhash"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
-
-# Public: no token needed. Private: export GITHUB_TOKEN before --update.
 remote_url="https://raw.githubusercontent.com/kuchida75/renhash/main/renhash"
 
-# ---------- Defaults ----------
 prefix="flower"
 start=1
 digits=3
 pattern="*.png"
-jobs="$(nproc || echo 4)"
+jobs="$(nproc 2>/dev/null || printf 4)"
 dry_run=0
 use_color=1
 limit_print=0
 plan_file=""
-sort_key="old"   # old|new
+sort_key="old"                 # Display order only; numbering uses sort_by.
+sort_by="name"
+reverse=0
+birth_fallback="error"
 undo_file=""
 resume=0
 resume_from=""
+update=0
 
-# ---------- Arg parse ----------
-while [[ $# -gt 0 ]]; do
+fail_arg() { printf 'renhash: %s\n' "$*" >&2; exit 1; }
+need_value() { (( $# >= 2 )) && [[ -n $2 ]] || fail_arg "Missing value for $1"; }
+while (( $# )); do
   case "$1" in
-    --prefix) prefix="${2:?}"; shift 2;;
-    --start)  start="${2:?}"; shift 2;;
-    --digits) digits="${2:?}"; shift 2;;
-    --pattern) pattern="${2:?}"; shift 2;;
-    --jobs)   jobs="${2:?}"; shift 2;;
+    --prefix) need_value "$@"; prefix=$2; shift 2;;
+    --start) need_value "$@"; start=$2; shift 2;;
+    --digits) need_value "$@"; digits=$2; shift 2;;
+    --pattern) need_value "$@"; pattern=$2; shift 2;;
+    --jobs) need_value "$@"; jobs=$2; shift 2;;
     --dry-run) dry_run=1; shift;;
-    --limit)  limit_print="${2:?}"; shift 2;;
-    --plan)   plan_file="${2:?}"; shift 2;;
-    --sort)   sort_key="${2:?}"; shift 2;;
-    --undo)   undo_file="${2:?}"; shift 2;;
+    --limit) need_value "$@"; limit_print=$2; shift 2;;
+    --plan) need_value "$@"; plan_file=$2; shift 2;;
+    --sort) need_value "$@"; sort_key=$2; shift 2;;
+    --sort-by) need_value "$@"; sort_by=$2; shift 2;;
+    --reverse) reverse=1; shift;;
+    --birth-fallback) need_value "$@"; birth_fallback=$2; shift 2;;
+    --undo) need_value "$@"; undo_file=$2; shift 2;;
     --resume) resume=1; shift;;
-    --resume-from) resume_from="${2:?}"; shift 2;;
+    --resume-from) need_value "$@"; resume_from=$2; shift 2;;
     --no-color) use_color=0; shift;;
-    --version|-v) echo "$SCRIPT_NAME v$VERSION"; exit 0;;
-    --update)
-      if [[ -z "$remote_url" ]]; then
-        echo "No update URL configured. Edit \$remote_url in the script." >&2; exit 1
-      fi
-      auth=(); [[ -n "${GITHUB_TOKEN:-}" ]] && auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
-      command -v curl >/dev/null 2>&1 || { echo "curl required for --update" >&2; exit 1; }
-      echo "Updating $SCRIPT_NAME from $remote_url" >&2
-      if curl -fsSL "${auth[@]}" "$remote_url" -o "$SCRIPT_PATH"; then
-        chmod +x "$SCRIPT_PATH"; echo "Updated $SCRIPT_NAME successfully." >&2; exit 0
-      else
-        echo "Update failed. For private repos, export GITHUB_TOKEN first." >&2; exit 1
-      fi
-      ;;
+    --version|-v) printf '%s v%s\n' "$SCRIPT_NAME" "$VERSION"; exit 0;;
+    --update) update=1; shift;;
     -h|--help)
-cat <<'HELP'
-renhash — fast parallel renamer to <prefix>_<index>_<RANDOM6>.<ext>, with undo & resume.
+      cat <<'HELP'
+renhash — rename to <prefix>_<index>_<RANDOM6>[.<ext>], with undo & resume.
+Usage: renhash [options]       Run inside the folder to rename (no recursion).
 
-Usage:
-  renhash [options]
+  --prefix NAME              Prefix (default: flower; no /)
+  --start N                  First index (default: 1)
+  --digits N                 Minimum zero padding (default: 3; expands as needed)
+  --pattern GLOB             Match regular filenames (default: *.png; dotfiles need leading .)
+  --jobs N                   Parallel rename/undo workers (default: nproc; max: 1024)
+  --sort-by name|mtime|birth  Number by filename, modification or filesystem birth time
+                             (default: name; time order is oldest first)
+  --reverse                  Newest first; name order is descending for --sort-by name
+  --birth-fallback error|mtime
+                             If ANY birth time is unknown, fail (default), or order the
+                             ENTIRE batch by mtime with a warning; never use ctime
+  --resume                   Skip current-prefix renamed files; start after their max
+                             index across all extensions (decimal, any padding width)
+  --resume-from N            Manual start; also skip renamed files; overrides --resume
+  --dry-run                  Print a colored, shell-escaped PLAN; do not rename
+  --limit N                  Show at most N preview rows (0 = all; full plan is saved)
+  --sort old|new             Display PLAN by old/new name; never changes numbering
+                             (default: old; --plan always keeps numbering order)
+  --plan FILE                Save a new escaped TSV plan; refuse to overwrite any path
+  --undo FILE                Reverse a v2 or legacy TSV plan in the current folder
+  --no-color                 Disable colors and icons (automatic when output is piped)
+  --version, -v              Show version
+  --update                   Self-update from GitHub (GITHUB_TOKEN for private repos)
+  -h, --help                 Show help
 
-General:
-  --prefix NAME        Prefix for new files (default: flower)
-  --start N            Starting index (default: 1)
-  --digits N           Zero padding width (default: 3; auto-expands if needed)
-  --pattern GLOB       File pattern to select inputs (default: *.png)
-  --jobs N             Parallel workers (default: nproc)
-
-Modes:
-  --dry-run            Preview only; print PLAN (no changes)
-  --limit N            In dry-run, show only first N lines
-  --plan FILE          Save full TSV mapping to FILE (src<TAB>dst)
-  --sort old|new       Sort PLAN by old or new name (default: old)
-  --undo FILE          Revert using a TSV plan (moves dst -> src)
-  --resume             Auto-detect max index from existing PREFIX_<n>_* files and start at n+1
-  --resume-from N      Manually set resume start index (overrides --resume)
-  --no-color           Disable colored output and icons
-  --version, -v        Show version
-  --update             Self-update from remote URL (set GITHUB_TOKEN if repo is private)
-  -h, --help           Show this help
+Names in v2 plans escape backslash, tab, newline and carriage return. No plan or
+filename is evaluated as shell code. Dry runs generate fresh random suffixes;
+rerunning makes a new plan, not an exact replay. See README.md for recovery notes.
 HELP
       exit 0;;
-    *) echo "Unknown option: $1" >&2; exit 1;;
+    *) fail_arg "Unknown option: $1";;
   esac
 done
 
-# ---------- Colors & Icons (stderr-only logs) ----------
-if [[ ! -t 1 ]]; then use_color=0; fi
-if [[ $use_color -eq 1 ]]; then
-  C0="$(printf '\033[0m')"; CG="$(printf '\033[38;5;112m')"; CY="$(printf '\033[38;5;214m')"
-  CR="$(printf '\033[38;5;203m')"; CB="$(printf '\033[38;5;81m')"
-  CS="$(printf '\033[38;5;39m')";  CD="$(printf '\033[38;5;199m')"
-  OK="✓"; WARN="⚠"; ERR="✗"
-else
-  C0=""; CG=""; CY=""; CR=""; CB=""; CS=""; CD=""; OK="[OK]"; WARN="[!]"; ERR="[X]"
-fi
-banner(){ printf "%b==> %s%b\n" "$CB" "$1" "$C0" >&2; }
-ok()    { printf "%b%s%b %s\n" "$CG" "$OK" "$C0" "$*" >&2; }
-warn()  { printf "%b%s%b %s\n" "$CY" "$WARN" "$C0" "$*" >&2; }
-err()   { printf "%b%s%b %s\n" "$CR" "$ERR" "$C0" "$*" >&2; }
-die()   { err "$*"; exit 1; }
-
-# ---------- Undo mode ----------
-if [[ -n "$undo_file" ]]; then
-  [[ -f "$undo_file" ]] || die "Undo file not found: $undo_file"
-  banner "UNDO from TSV: $undo_file"
-  if [[ "$dry_run" -eq 1 ]]; then
-    awk -F'\t' -v S="$CS" -v D="$CD" -v R="$C0" '{printf "%s\"%s\"%s -> %s\"%s\"%s\n", D,$2,R,S,$1,R}' "$undo_file" \
-      | { if [[ "$limit_print" -gt 0 ]]; then head -n "$limit_print"; else cat; fi; }
-    ok "Undo dry run complete."; exit 0
-  fi
-  do_undo(){ local src="$1" dst="$2"
-    if [[ ! -e "$dst" ]]; then warn "Skip (missing): $dst"; return 0; fi
-    if [[ -e "$src" && "$(readlink -f -- "$src")" != "$(readlink -f -- "$dst")" ]]; then
-      warn "Skip (would overwrite): $src"; return 0; fi
-    if mv -- "$dst" "$src"; then ok "Reverted: $dst → $src"; else err "Failed: $dst → $src"; return 1; fi
-  }
-  export -f do_undo ok warn err
-  if command -v parallel >/dev/null 2>&1; then
-    awk -F'\t' '{printf "do_undo \"%s\" \"%s\"\n", $1, $2}' "$undo_file" | parallel --no-notice --linebuffer
-  else
-    while IFS=$'\t' read -r src dst; do do_undo "$src" "$dst"; done < "$undo_file"
-  fi
-  ok "Undo complete."; exit 0
-fi
-
-# ---------- Regular rename ----------
-has_parallel=0; command -v parallel >/dev/null 2>&1 && has_parallel=1
-
-shopt -s nullglob
-mapfile -d '' files < <(bash -lc 'shopt -s nullglob; for f in '"$pattern"'; do printf "%s\0" "$f"; done' | LC_ALL=C sort -z)
-total=${#files[@]}
-(( total == 0 )) && { warn "No files match pattern: $pattern"; exit 0; }
-
-banner "Found $total file(s). Prefix='${prefix}', start=${start}, digits=${digits}, jobs=${jobs}${dry_run:+, DRY-RUN}"
-
-# ----- Resume handling -----
-if [[ -n "$resume_from" ]]; then
-  start="$resume_from"
-  warn "Resume-from: manually starting at index ${start}"
-elif (( resume == 1 )); then
-  max_existing=0
-  # Look for files like PREFIX_<idx>_... (any extension)
-  for f in "${prefix}"_*_*.*; do
-    [[ -f "$f" ]] || continue
-    base="${f##*/}"
-    IFS=_ read -r p idx _rest <<<"$base" || true
-    if [[ "$p" == "$prefix" && "$idx" =~ ^[0-9]+$ ]]; then
-      # Force base-10 to avoid octal pitfalls with leading zeros (e.g., 0148)
-      idx10=$((10#$idx))
-      (( idx10 > max_existing )) && max_existing="$idx10"
-    fi
-  done
-  start=$(( max_existing + 1 ))
-  warn "Resume: detected max existing index ${max_existing}; starting at ${start}"
-fi
-
-tmpdir="$(mktemp -d)"
-hashes_tsv="$tmpdir/hashes.tsv"
-mapping_tsv="$tmpdir/mapping.tsv"
-
-# Random 6-char uppercase hex
-rand6(){ if command -v openssl >/dev/null 2>&1; then openssl rand -hex 3 | tr '[:lower:]' '[:upper:]'
-         else od -An -N3 -tx1 /dev/urandom | tr -d ' \n' | tr '[:lower:]' '[:upper:]'; fi; }
-gen_hash_line(){ local file="$1" h; h="$(rand6)"; printf "%s\t%s\n" "$file" "$h"; }
-export -f gen_hash_line rand6
-
-banner "Pass 1/3: generating random hashes"
-if [[ $has_parallel -eq 1 ]]; then
-  if [[ $dry_run -eq 1 ]]; then
-    printf "%s\0" "${files[@]}" | parallel -0 -n1 -j "$jobs" --no-notice --linebuffer gen_hash_line {} \
-      | LC_ALL=C sort -t $'\t' -k1,1 > "$hashes_tsv"
-  else
-    printf "%s\0" "${files[@]}" | parallel -0 -n1 -j "$jobs" --no-notice --bar --linebuffer gen_hash_line {} \
-      | LC_ALL=C sort -t $'\t' -k1,1 > "$hashes_tsv"
-  fi
-else
-  : > "$hashes_tsv"; for f in "${files[@]}"; do gen_hash_line "$f" >> "$hashes_tsv"; done
-fi
-ok "Hashes prepared"
-
-# Compute padding width BEFORE mapping
-max_index=$(( start + total - 1 ))
-required_digits=${#max_index}
-if (( digits < required_digits )); then
-  digits=$required_digits
-  warn "Padding expanded to ${digits} digits to accommodate index ${max_index}"
-fi
-
-banner "Pass 2/3: assigning indices"
-pad(){ printf "%0*d" "$digits" "$1"; }
-declare -A used_targets=()
-i="$start"
-while IFS=$'\t' read -r file h; do
-  ext="${file##*.}"; [[ "$ext" == "$file" ]] && ext="png"
-  while :; do
-    idx="$(pad "$i")"
-    new="${prefix}_${idx}_${h}.${ext}"
-    if [[ ! -e "$new" && -z "${used_targets[$new]+x}" ]]; then break; fi
-    ((i++))
-  done
-  used_targets["$new"]=1
-  printf "%s\t%s\n" "$file" "$new"
-  ((i++))
-done < "$hashes_tsv" > "$mapping_tsv"
-ok "Index mapping created"
-
-[[ -n "$plan_file" ]] && { cp "$mapping_tsv" "$plan_file"; ok "Wrote plan TSV → $plan_file"; }
-
-if [[ "$dry_run" -eq 1 ]]; then
-  banner "PLAN"
-  if [[ "$sort_key" == "new" ]]; then
-    sortfeed() { awk -F'\t' '{print $2"\t"$1}' "$mapping_tsv" | LC_ALL=C sort | awk -F'\t' '{print $2"\t"$1}'; }
-  else
-    sortfeed() { cat "$mapping_tsv"; }
-  fi
-  sortfeed | awk -F'\t' -v S="$CS" -v D="$CD" -v R="$C0" \
-                   '{printf "%s\"%s\"%s -> %s\"%s\"%s\n", S,$1,R,D,$2,R}' \
-         | { if [[ "$limit_print" -gt 0 ]]; then head -n "$limit_print"; else cat; fi; }
-  ok "Dry run complete. No files were renamed."
-  rm -rf "$tmpdir"; exit 0
-fi
-
-banner "Pass 3/3: renaming files"
-do_move(){ local src="$1" dst="$2"
-  if mv -- "$src" "$dst"; then ok "Renamed: $src → $dst"; else err "Failed: $src → $dst"; return 1; fi
+(( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )) ||
+  fail_arg 'Bash 4.4 or newer is required'
+# All values enter arithmetic only after validation and decimal normalization.
+number() {
+  local value=$2
+  [[ $value =~ ^[0-9]+$ ]] || fail_arg "$1 must be a decimal integer"
+  value=${value#"${value%%[!0]*}"}
+  value=${value:-0}
+  (( ${#value} <= 18 )) || fail_arg "$1 is too large (maximum 18 digits)"
+  REPLY=$value
 }
-export -f do_move ok err
-if [[ $has_parallel -eq 1 ]]; then
-  awk -F'\t' '{printf "do_move \"%s\" \"%s\"\n", $1, $2}' "$mapping_tsv" \
-    | parallel -j "$jobs" --no-notice --bar --linebuffer
-else
-  while IFS=$'\t' read -r src dst; do do_move "$src" "$dst"; done < "$mapping_tsv"
+number --start "$start"; start=$REPLY
+number --digits "$digits"; digits=$REPLY
+number --jobs "$jobs"; jobs=$REPLY
+number --limit "$limit_print"; limit_print=$REPLY
+(( start >= 1 )) || fail_arg '--start must be positive'
+(( digits >= 1 && digits <= 255 )) || fail_arg '--digits must be between 1 and 255'
+(( jobs >= 1 && jobs <= 1024 )) || fail_arg '--jobs must be between 1 and 1024'
+if [[ -n $resume_from ]]; then
+  number --resume-from "$resume_from"; resume_from=$REPLY
+  (( resume_from >= 1 )) || fail_arg '--resume-from must be positive'
+fi
+[[ $prefix != */* ]] || fail_arg '--prefix must be a single filename component (no /)'
+[[ $pattern != */* ]] || fail_arg '--pattern matches filenames in the current folder (no /)'
+[[ $sort_by == name || $sort_by == mtime || $sort_by == birth ]] || fail_arg 'Invalid --sort-by (use name, mtime or birth)'
+[[ $sort_key == old || $sort_key == new ]] || fail_arg 'Invalid --sort (use old or new)'
+[[ $birth_fallback == error || $birth_fallback == mtime ]] || fail_arg 'Invalid --birth-fallback (use error or mtime)'
+[[ -z $undo_file || -z $plan_file ]] || fail_arg '--plan cannot be used with --undo'
+
+if [[ ! -t 1 ]]; then use_color=0; fi
+C0=""; CG=""; CY=""; CR=""; CB=""; CS=""; CD=""
+OK="[OK]"; WARN="[!]"; ERR="[X]"
+if (( use_color )); then
+  C0=$'\033[0m'; CG=$'\033[38;5;112m'; CY=$'\033[38;5;214m'
+  CR=$'\033[38;5;203m'; CB=$'\033[38;5;81m'
+  CS=$'\033[38;5;39m'; CD=$'\033[38;5;199m'
+  OK="✓"; WARN="⚠"; ERR="✗"
+fi
+banner() { printf '%s==> %s%s\n' "$CB" "$*" "$C0" >&2; }
+ok() { printf '%s%s%s %s\n' "$CG" "$OK" "$C0" "$*" >&2; }
+warn() { printf '%s%s%s %s\n' "$CY" "$WARN" "$C0" "$*" >&2; }
+err() { printf '%s%s%s %s\n' "$CR" "$ERR" "$C0" "$*" >&2; }
+die() { err "$*"; exit 1; }
+quote() { printf -v REPLY '%q' "$1"; }
+
+for dependency in find sort stat od tr fold xargs mv mktemp cmp cp rm; do
+  command -v "$dependency" >/dev/null 2>&1 || die "Required command not found: $dependency"
+done
+umask 077
+tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/renhash.XXXXXXXX")
+keep_tmp=0
+recovery_plan="$tmpdir/plan.tsv"
+cleanup() {
+  local status=$?
+  if (( keep_tmp )); then
+    quote "$recovery_plan"
+    warn "Run incomplete; recovery plan retained at $REPLY (undo from this folder)."
+    if [[ $recovery_plan != "$tmpdir/"* ]]; then rm -rf -- "$tmpdir"; fi
+  else
+    rm -rf -- "$tmpdir"
+  fi
+  return "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if (( update )); then
+  command -v curl >/dev/null 2>&1 || die 'curl required for --update'
+  SCRIPT_PATH=$(readlink -f -- "$SCRIPT_PATH")
+  auth=()
+  [[ -z ${GITHUB_TOKEN:-} ]] || auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
+  # A failed/partial download must not truncate the installed script.
+  curl -fsSL "${auth[@]}" "$remote_url" -o "$tmpdir/update" || die 'Update download failed'
+  bash -n "$tmpdir/update" || die 'Downloaded update is not valid Bash'
+  [[ -s $tmpdir/update ]] || die 'Downloaded update is empty'
+  cp -- "$tmpdir/update" "$SCRIPT_PATH" || die 'Could not install update'
+  chmod +x -- "$SCRIPT_PATH"
+  ok 'Updated renhash successfully.'
+  exit 0
 fi
 
-ok "All done."
-rm -rf "$tmpdir"
+# Internal filenames and mappings are NUL-delimited. TSV is an interchange format
+# only; never feed user data to eval, a shell command string, or an awk program.
+escape_field() {
+  REPLY=${1//\\/\\\\}
+  REPLY=${REPLY//$'\t'/\\t}
+  REPLY=${REPLY//$'\n'/\\n}
+  REPLY=${REPLY//$'\r'/\\r}
+}
+unescape_field() {
+  local value=$1 char offset
+  REPLY=""
+  for (( offset=0; offset<${#value}; offset++ )); do
+    char=${value:offset:1}
+    if [[ $char == \\ ]]; then
+      (( offset += 1 ))
+      case ${value:offset:1} in
+        \\) char=\\;;
+        t) char=$'\t';;
+        n) char=$'\n';;
+        r) char=$'\r';;
+        *) die 'Invalid escape in v2 plan';;
+      esac
+    fi
+    REPLY+=$char
+  done
+}
+valid_name() {
+  [[ -n $1 && $1 != . && $1 != .. && $1 != */* ]] || die 'Plan contains an empty name or a path outside the current folder'
+}
+exists() { [[ -e $1 || -L $1 ]]; }
+regular() { [[ -f $1 && ! -L $1 ]]; }
+
+sources=(); destinations=()
+write_plan() {
+  local row source destination
+  printf '# renhash-plan-v2\n'
+  for (( row=0; row<${#sources[@]}; row++ )); do
+    escape_field "${sources[row]}"; source=$REPLY
+    escape_field "${destinations[row]}"; destination=$REPLY
+    printf '%s\t%s\n' "$source" "$destination"
+  done
+}
+preview() {
+  local row source destination key shown=0
+  # Sort NUL records with filename as the entire key (including any tabs).
+  for (( row=0; row<${#sources[@]}; row++ )); do
+    if [[ $sort_key == new ]]; then
+      printf '%s\0' "${destinations[row]}"
+    else
+      printf '%s\0' "${sources[row]}"
+    fi
+  done | sort -z > "$tmpdir/display"
+  declare -A rows=()
+  for (( row=0; row<${#sources[@]}; row++ )); do
+    if [[ $sort_key == new ]]; then rows["${destinations[row]}"]=$row
+    else rows["${sources[row]}"]=$row; fi
+  done
+  while IFS= read -r -d '' key; do
+    if (( limit_print > 0 && shown >= limit_print )); then break; fi
+    row=${rows[$key]}
+    source=${sources[row]}; destination=${destinations[row]}
+    # %q also protects terminals against newlines, control codes and escape bytes.
+    printf '%s%q%s -> %s%q%s\n' "$CS" "$source" "$C0" "$CD" "$destination" "$C0"
+    (( shown += 1 ))
+  done < "$tmpdir/display"
+}
+
+if [[ -n $undo_file ]]; then
+  regular "$undo_file" || die 'Undo plan must be a regular file, not a symlink'
+  # Bash read discards NUL bytes: detect them before parsing, rather than silently
+  # interpreting a corrupted plan as a different set of names.
+  tr -d '\000' < "$undo_file" > "$tmpdir/without-nuls"
+  cmp -s -- "$undo_file" "$tmpdir/without-nuls" || die 'Undo plan contains NUL bytes'
+  declare -A undo_sources=() undo_destinations=()
+  version=1; line_number=0
+  while IFS= read -r line || [[ -n $line ]]; do
+    (( line_number += 1 ))
+    if (( line_number == 1 )) && [[ $line == '# renhash-plan-v2' ]]; then version=2; continue; fi
+    [[ $line == *$'\t'* ]] || die "Invalid TSV row $line_number"
+    source=${line%%$'\t'*}; destination=${line#*$'\t'}
+    [[ $destination != *$'\t'* ]] || die "Too many TSV columns on row $line_number"
+    if (( version == 2 )); then
+      unescape_field "$source"; source=$REPLY
+      unescape_field "$destination"; destination=$REPLY
+    fi
+    # Accept the harmless ./ prefix in old plans; reject all other path syntax.
+    source=${source#./}; destination=${destination#./}
+    valid_name "$source"; valid_name "$destination"
+    [[ $source != "$destination" ]] || die "Self-mapping on row $line_number"
+    [[ ! ${undo_sources[$source]+present} && ! ${undo_destinations[$destination]+present} ]] || die 'Duplicate names in undo plan'
+    undo_sources["$source"]=1; undo_destinations["$destination"]=1
+    sources+=("$source"); destinations+=("$destination")
+  done < "$tmpdir/without-nuls"
+  (( ${#sources[@]} > 0 )) || die 'Undo plan has no mappings'
+  # Reject chains and cycles so parallel undo cannot overwrite another row's input.
+  for source in "${sources[@]}"; do
+    [[ ! ${undo_destinations[$source]+present} ]] || die 'Overlapping source/destination names in undo plan'
+  done
+  active_sources=(); active_destinations=()
+  for (( row=0; row<${#sources[@]}; row++ )); do
+    source=${sources[row]}; destination=${destinations[row]}
+    if ! exists "$destination"; then
+      quote "$destination"; warn "Skip missing undo input: $REPLY (already restored or never renamed)"
+      continue
+    fi
+    regular "$destination" || die 'Undo input is not a regular file or is a symlink'
+    if exists "$source"; then quote "$source"; die "Undo would overwrite: $REPLY"; fi
+    active_sources+=("$destination"); active_destinations+=("$source")
+  done
+  sources=("${active_sources[@]}"); destinations=("${active_destinations[@]}")
+  banner "UNDO: ${#sources[@]} file(s)"
+else
+  # Refuse to overwrite even a dangling symlink or a source file with --plan.
+  if [[ -n $plan_file ]] && exists "$plan_file"; then die '--plan path already exists; choose a new filename'; fi
+  find . -maxdepth 1 -type f -printf '%f\0' | sort -z > "$tmpdir/all-files"
+  mapfile -d '' -t all_files < "$tmpdir/all-files"
+  declare -A renamed=()
+  max_existing=0
+  if (( resume )) || [[ -n $resume_from ]]; then
+    for file in "${all_files[@]}"; do
+      [[ $file == "${prefix}_"* ]] || continue
+      rest=${file#"${prefix}_"}
+      if [[ $rest =~ ^([0-9]+)_[[:xdigit:]]{6}(\..*)?$ ]]; then
+        number 'Existing resume index' "${BASH_REMATCH[1]}"; index=$REPLY
+        renamed["$file"]=1
+        if (( index > max_existing )); then max_existing=$index; fi
+      fi
+    done
+  fi
+  if [[ -n $resume_from ]]; then
+    start=$resume_from; warn "Resume-from: manually starting at index $start"
+  elif (( resume )); then
+    (( max_existing < 999999999999999999 )) || die 'Resume index would exceed 18 digits'
+    start=$(( max_existing + 1 )); warn "Resume: max existing index $max_existing; starting at $start"
+  fi
+  files=()
+  for file in "${all_files[@]}"; do
+    # Preserve shell-glob dotfile behavior without evaluating a shell command.
+    if [[ $file == .* && $pattern != .* ]]; then continue; fi
+    if [[ $file == $pattern && ! ${renamed[$file]+present} ]]; then files+=("$file"); fi
+  done
+  total=${#files[@]}
+  if (( total == 0 )); then warn 'No eligible regular files match the pattern'; exit 0; fi
+  printf '%s\0' "${files[@]}" > "$tmpdir/inputs"
+  effective_sort=$sort_by
+  if [[ $sort_by == name ]]; then
+    if (( reverse )); then sort -zr "$tmpdir/inputs" > "$tmpdir/ordered"
+    else cp -- "$tmpdir/inputs" "$tmpdir/ordered"; fi
+  else
+    if [[ $sort_by == birth ]]; then
+      # UTC and C locale make the human timestamp a full-precision subsecond key;
+      # the numeric epoch key handles pre-1970 dates too. %w == '-' means unknown.
+      TZ=UTC0 xargs -0 -r stat --printf='%W\t%w\t%n\0' -- < "$tmpdir/inputs" > "$tmpdir/times"
+      missing_birth=0
+      while IFS= read -r -d '' record; do
+        rest=${record#*$'\t'}
+        if [[ ${rest%%$'\t'*} == - ]]; then missing_birth=1; break; fi
+      done < "$tmpdir/times"
+      if (( missing_birth )); then
+        if [[ $birth_fallback == error ]]; then
+          die 'Birth time unavailable for one or more inputs; use --birth-fallback mtime or --sort-by mtime'
+        fi
+        warn 'Birth time unavailable; ordering the ENTIRE batch by mtime'
+        effective_sort=mtime
+      fi
+    fi
+    if [[ $effective_sort == mtime ]]; then
+      TZ=UTC0 xargs -0 -r stat --printf='%Y\t%y\t%n\0' -- < "$tmpdir/inputs" > "$tmpdir/times"
+    fi
+    if (( reverse )); then
+      sort -z -t $'\t' -k1,1nr -k2,2r -k3 "$tmpdir/times" > "$tmpdir/sorted-times"
+    else
+      sort -z -t $'\t' -k1,1n -k2,2 -k3 "$tmpdir/times" > "$tmpdir/sorted-times"
+    fi
+    while IFS= read -r -d '' record; do
+      record=${record#*$'\t'}
+      printf '%s\0' "${record#*$'\t'}"
+    done < "$tmpdir/sorted-times" > "$tmpdir/ordered"
+  fi
+  mapfile -d '' -t files < "$tmpdir/ordered"
+  (( ${#files[@]} == total )) || die 'File count changed while collecting timestamps'
+  (( start <= 999999999999999999 - total + 1 )) || die 'Final index would exceed 18 digits'
+  max_index=$(( start + total - 1 ))
+  if (( digits < ${#max_index} )); then
+    digits=${#max_index}; warn "Padding expanded to $digits digits for index $max_index"
+  fi
+  name_max=$(getconf NAME_MAX . 2>/dev/null || printf 255)
+  [[ $name_max =~ ^[0-9]+$ ]] || name_max=255
+  # Generate random suffixes in one batch, with no filename data in the stream.
+  od -An -v -N "$(( total * 3 ))" -tx1 /dev/urandom | tr -d ' \n' | tr 'a-f' 'A-F' | fold -w6 > "$tmpdir/hashes"
+  mapfile -t hashes < "$tmpdir/hashes"
+  (( ${#hashes[@]} == total )) || die 'Could not generate random suffixes'
+  rand6() { od -An -N3 -tx1 /dev/urandom | tr -d ' \n' | tr 'a-f' 'A-F'; }
+  declare -A used_targets=()
+  index=$start
+  for (( row=0; row<total; row++ )); do
+    file=${files[row]}; hash=${hashes[row]}
+    extension=""; stem=${file#.}
+    if [[ $stem == *.* ]]; then extension=".${file##*.}"; fi
+    printf -v padded '%0*d' "$digits" "$index"
+    attempts=0
+    while :; do
+      [[ $hash =~ ^[0-9A-F]{6}$ ]] || die 'Invalid random suffix'
+      new="${prefix}_${padded}_${hash}${extension}"
+      (( ${#new} <= name_max )) || die 'Generated filename exceeds the filesystem name limit'
+      if ! exists "$new" && [[ ! ${used_targets[$new]+present} ]]; then break; fi
+      (( attempts += 1 ))
+      (( attempts < 100 )) || die 'Could not allocate an unused random target'
+      hash=$(rand6)
+    done
+    used_targets["$new"]=1
+    sources+=("$file"); destinations+=("$new")
+    (( index += 1 ))
+  done
+  mode=""; if (( dry_run )); then mode=", DRY-RUN"; fi
+  quote "$prefix"
+  banner "Found $total file(s). Prefix=$REPLY, start=$start, digits=$digits, jobs=$jobs, sort-by=$effective_sort$mode"
+fi
+
+# Validate the complete batch before saving a plan or performing any moves.
+for (( row=0; row<${#sources[@]}; row++ )); do
+  regular "${sources[row]}" || die 'A source is missing, is a symlink, or is no longer regular'
+  if exists "${destinations[row]}"; then quote "${destinations[row]}"; die "Target already exists: $REPLY"; fi
+done
+if [[ -z $undo_file ]]; then
+  write_plan > "$recovery_plan"
+  if [[ -n $plan_file ]]; then
+    # noclobber refuses races and symlinks as well as existing regular files.
+    (set -o noclobber; cat -- "$recovery_plan" > "$plan_file") || die 'Could not save a new plan'
+    quote "$plan_file"; ok "Wrote escaped TSV plan: $REPLY"
+    recovery_plan=$plan_file
+  fi
+else
+  recovery_plan=$undo_file
+fi
+
+if (( dry_run )); then
+  banner PLAN
+  preview
+  ok 'Dry run complete. No files were renamed.'
+  exit 0
+fi
+
+# xargs passes each NUL-delimited pair as positional arguments to a FIXED shell
+# program; neither filenames nor plan contents are ever interpolated into code.
+# -nT prevents clobbering, including a late-created directory/dangling symlink.
+# Older GNU mv returns success for skipped moves: also check the source is gone.
+do_move() {
+  local source=$1 destination=$2
+  if [[ ! -f $source || -L $source || -e $destination || -L $destination ]]; then
+    printf 'renhash: refusing unsafe move: %q -> %q\n' "$source" "$destination" >&2
+    return 1
+  fi
+  if mv -nT -- "$source" "$destination" && [[ ! -e $source && ! -L $source ]]; then
+    printf '%s%s%s Renamed: %q -> %q\n' "$CG" "$OK" "$C0" "$source" "$destination" >&2
+  else
+    printf 'renhash: move failed or skipped: %q -> %q\n' "$source" "$destination" >&2
+    return 1
+  fi
+}
+export -f do_move
+export CG OK C0
+for (( row=0; row<${#sources[@]}; row++ )); do
+  printf '%s\0%s\0' "${sources[row]}" "${destinations[row]}"
+done > "$tmpdir/moves"
+keep_tmp=1
+banner "Renaming ${#sources[@]} file(s) with $jobs worker(s)"
+if ! xargs -0 -r -n2 -P "$jobs" bash -c 'do_move "$@"' renhash-worker < "$tmpdir/moves"; then
+  die 'One or more moves failed. Successful moves can be reversed with --undo.'
+fi
+keep_tmp=0
+ok 'All done.'
